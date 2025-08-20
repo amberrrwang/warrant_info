@@ -275,41 +275,54 @@ def add_calc_sheet(wb, data_sheet="元大權證", default_wid="", default_target
     calc = wb["試算"] if "試算" in wb.sheetnames else wb.create_sheet("試算")
     calc.delete_rows(1, calc.max_row or 1)
 
+    # 輸入欄位
     calc["A1"] = "WID"
     calc["A2"] = "標的股價"
     calc["A3"] = "買價隱波（％）"
-    calc["A5"] = "無風險利率 r（年化）"
+    calc["A4"] = "評價日"
+    calc["A6"] = "無風險利率 r（年化）"
     calc["F1"] = "（以下自動帶入）"
     calc["F2"] = "履約價 K"
     calc["F3"] = "剩餘天數"
     calc["F4"] = "行使比例（數值）"
 
+    # 預填欄位值
     calc["B1"] = default_wid or "03111U"
     calc["B2"] = default_target_px or ""
     calc["B3"] = default_iv or ""
-    calc["B5"] = 0.01  # 1% demo; change as needed
+    calc["B4"] = datetime.now().strftime("%Y/%m/%d")
+    calc["B6"] = 0.01  # 無風險利率
 
-    # Bring K / days / ratio by header names from data sheet
-    calc["G2"] = (f"=INDEX('{data_sheet}'!$A:$ZZ, MATCH($B$1,'{data_sheet}'!$A:$A,0), MATCH(\"最新履約價\",'{data_sheet}'!$1:$1,0))")
-    calc["G3"] = (f"=INDEX('{data_sheet}'!$A:$ZZ, MATCH($B$1,'{data_sheet}'!$A:$A,0), MATCH(\"剩餘天數\",'{data_sheet}'!$1:$1,0))")
+    # 自動抓資料欄位
+    calc["G2"] = (
+        f'=IFERROR(INDEX(\'{data_sheet}\'!$A:$ZZ, MATCH($B$1, \'{data_sheet}\'!$A:$A, 0), '
+        f'MATCH("最新履約價", \'{data_sheet}\'!$1:$1, 0)), "")'
+    )
+    calc["G3"] = (
+        f'=IFERROR(INDEX(\'{data_sheet}\'!$A:$ZZ, MATCH($B$1, \'{data_sheet}\'!$A:$A, 0), '
+        f'MATCH("剩餘天數", \'{data_sheet}\'!$1:$1, 0)), "")'
+    )
+    # ✅ 修正這段！抓不到冒號就不要找冒號
     calc["G4"] = (
-        f"=VALUE(LEFT(INDEX('{data_sheet}'!$A:$ZZ, MATCH($B$1,'{data_sheet}'!$A:$A,0),"
-        f" MATCH(\"最新行使比例\",'{data_sheet}'!$1:$1,0)), FIND(\":\", INDEX('{data_sheet}'!$A:$ZZ, "
-        f" MATCH($B$1,'{data_sheet}'!$A:$A,0), MATCH(\"最新行使比例\",'{data_sheet}'!$1:$1,0)))-1))"
+        f'=IFERROR(INDEX(\'{data_sheet}\'!$A:$ZZ, MATCH($B$1, \'{data_sheet}\'!$A:$A, 0), '
+        f'MATCH("最新行使比例", \'{data_sheet}\'!$1:$1, 0)), "")'
     )
 
-    # Black-Scholes call (no dividends); warrant price = option / ratio
-    calc["C9"]  = "理論權證價"
+    # 理論價格計算
+    calc["C9"] = "理論權證價"
     calc["C10"] = (
-        "=LET(S,$B$2, sigma,$B$3/100, K,$G$2, r,$B$5, T,$G$3/365,"
+        "=LET(S,$B$2, sigma,$B$3/100, K,$G$2, r,$B$6, T,$G$3/365,"
         " d1,(LN(S/K)+(r+0.5*sigma^2)*T)/(sigma*SQRT(T)), d2,d1-sigma*SQRT(T),"
         " C, S*NORM.S.DIST(d1,TRUE)-K*EXP(-r*T)*NORM.S.DIST(d2,TRUE), C/$G$4)"
     )
-    calc["C11"] = '="依您所輸入數據試算出：該檔權證可能的價格為 " & TEXT($C$10,"0.000")'
+    calc["C11"] = (
+        '="依您所輸入數據試算出：該檔權證可能的價格為 " & TEXT($C$10,"0.000")'
+    )
 
-    for col, width in [("A",16), ("B",18), ("C",34), ("F",22), ("G",18)]:
+    # 調整欄寬與格式
+    for col, width in [("A", 18), ("B", 18), ("C", 38), ("F", 24), ("G", 20)]:
         calc.column_dimensions[col].width = width
-    for cell in ["A1","A2","A3","A5","F2","F3","F4","C9"]:
+    for cell in ["A1", "A2", "A3", "A4", "A6", "F2", "F3", "F4", "C9"]:
         calc[cell].font = Font(bold=True)
 
 # ======= Save to Desktop Excel =======
