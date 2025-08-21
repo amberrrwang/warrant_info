@@ -200,7 +200,7 @@ def main():
             row = scrape_one_wid(driver, wid)
             print(f"→ 狀態:{row['狀態']} 成交:{row['成交價']} 買:{row['買價']} 賣:{row['賣價']} 標的:{row['標的名稱']} 價:{row['標的現價']}")
             rows.append(row)
-            time.sleep(0.3)  # 禮貌性間隔，避免過快
+            time.sleep(0.3)  
     finally:
         driver.quit()
 

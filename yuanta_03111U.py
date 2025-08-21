@@ -1,71 +1,48 @@
-# -*- coding: utf-8 -*-
-import os, re, time, requests
-from datetime import datetime
-
-# ---------- Selenium ----------
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
+from datetime import datetime
+import openpyxl, os, re, time
+import requests  # ← 新增：用來打 Yuanta API
 
-# ---------- Excel ----------
-import openpyxl
-from openpyxl.styles import Font
+# ======= 設定 =======
+wid_list = ["03111U"]
 
-# ======= CONFIG =======
-# Test with a single WID first; extend this list when ready.
-WID_LIST = ["03111U"]
-BASE = "https://www.warrantwin.com.tw/eyuanta"
-
-# Keep these headers stable so columns never disappear
 BASIC_LABELS = [
     "上市日期","最後交易日","到期日期","發行型態","最新發行張數",
     "流通在外張數/比例","最新履約價","最新行使比例",
     "買價隱波","賣價隱波","Delta","Theta",
     "剩餘天數","價內外程度","實質槓桿","買賣價差比"
 ]
+
+# 只保留「標的股價」，不再有「標的現價」
 HEADER_ORDER = [
     "WID","狀態","成交價","買價","賣價",
-    "標的名稱","標的現價","標的股價","標的代碼",
+    "標的名稱","標的股價","標的代碼",
     *BASIC_LABELS, "抓取時間","來源網址"
 ]
 
-# ======= Selenium driver =======
+# ======= 啟動 Driver =======
 def launch_driver(headless=False):
-    opts = webdriver.ChromeOptions()
+    options = webdriver.ChromeOptions()
     if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    if os.environ.get("CHROME_BIN"):
-        opts.binary_location = os.environ["CHROME_BIN"]
-    try:
-        svc = Service(ChromeDriverManager().install())
-        return webdriver.Chrome(service=svc, options=opts)
-    except WebDriverException as e:
-        raise SystemExit(f"🚨 Could not launch Chrome/Driver:\n{e}")
+        options.add_argument("--headless=new")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
 
-# ======= Helpers =======
+# ======= 抓資料輔助 =======
 def text_or_blank(driver, by, sel):
     try:
         return driver.find_element(by, sel).text.strip()
     except NoSuchElementException:
         return ""
-
-def wait_text_not_empty(driver, by, sel, timeout=20):
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.find_element(by, sel).text.strip() != ""
-    )
-    return driver.find_element(by, sel).text.strip()
-
-def parse_num(s):
-    if not s: return ""
-    m = re.search(r"(\d+(?:\.\d+)?)", str(s).replace(",", ""))
-    return m.group(1) if m else ""
 
 def find_basic_value_by_label(driver, label_text):
     xps = [
@@ -75,207 +52,172 @@ def find_basic_value_by_label(driver, label_text):
     ]
     for xp in xps:
         try:
-            el = driver.find_element(By.XPATH, xp)
-            txt = el.text.strip()
+            txt = driver.find_element(By.XPATH, xp).text.strip()
             if txt:
                 return txt
         except NoSuchElementException:
             continue
     return ""
 
-def get_target_info_from_page(driver):
-    """Fallback: 標的名稱 / 標的現價 (from DOM)"""
-    name = ""
-    price = ""
-    els = driver.find_elements(By.XPATH, "//*[contains(@ng-bind,'TAR_NAME') or contains(@ng-bind,'FLD_TAR_NAME')]")
-    if els and els[0].text.strip():
-        name = els[0].text.strip()
-    els = driver.find_elements(By.XPATH, "//*[contains(@ng-bind,'TAR_PRICE') or contains(@ng-bind,'FLD_TAR_PRICE')]")
-    if els and els[0].text.strip():
-        price = els[0].text.strip().replace(",", "")
-    if name or price:
-        return name, price
-    try:
-        blk = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), '標的')]").text.strip()
-        tail = re.split(r"標的[:：]", blk, 1)[1].strip() if "標的" in blk else blk
-        m_name = re.match(r"([^\s(／/｜|]+)", tail)
-        m_px   = re.search(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)", tail)
-        return (m_name.group(1) if m_name else ""), (m_px.group(1).replace(",", "") if m_px else "")
-    except Exception:
-        return "", ""
+def get_target_name_code(driver):
+    """抓標的名稱/代碼（不抓價）。"""
+    name, code = "", ""
 
-# ======= Underlying symbol (stock code) =======
-def get_symbol_from_dom(driver):
-    """Try TAR_NO / FLD_TAR_NO → ‘標的’ block → page source."""
-    try:
-        el = driver.find_element(By.XPATH, "//*[contains(@ng-bind,'TAR_NO') or contains(@ng-bind,'FLD_TAR_NO')]")
-        v = el.text.strip()
-        if parse_num(v):
-            return parse_num(v)
-    except NoSuchElementException:
-        pass
-    try:
-        blk = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), '標的')]").text
-        m = re.search(r"(\d{4})", blk)
-        if m: return m.group(1)
-    except NoSuchElementException:
-        pass
-    m = re.search(r"(^|[^0-9])(\d{4})([^0-9]|$)", driver.page_source)
-    if m: return m.group(2)
-    return ""
+    # 名稱
+    for xp in ["//*[contains(@ng-bind, 'TAR_NAME') or contains(@ng-bind, 'FLD_TAR_NAME')]"]:
+        els = driver.find_elements(By.XPATH, xp)
+        if els and els[0].text.strip():
+            name = els[0].text.strip()
+            break
 
-def get_underlying_symbol_by_wid(wid, driver):
-    for url in [
-        f"{BASE}/ws/GetWarData.ashx?wid={wid}",
-        f"{BASE}/ws/GetWarData.ashx?WID={wid}",
-        f"{BASE}/GetWarData.ashx?wid={wid}",
-    ]:
+    # 代碼
+    for xp in ["//*[contains(@ng-bind, 'TAR_CODE') or contains(@ng-bind, 'FLD_TAR_CODE')]"]:
+        els = driver.find_elements(By.XPATH, xp)
+        if els and els[0].text.strip():
+            code = re.sub(r"\D", "", els[0].text.strip())
+            break
+
+    # 備援：從含「標的」的文字解析
+    if not (name and code):
         try:
-            r = requests.get(url, timeout=8)
-            if r.ok:
-                j = r.json()
-                for k in ("STOCK_NO","TAR_NO","UNDERLYING","symbol","Symbol"):
-                    if k in j and parse_num(j[k]): return parse_num(j[k])
-                for box in ("data","result","info"):
-                    if isinstance(j.get(box), dict):
-                        for k in ("STOCK_NO","TAR_NO","UNDERLYING","symbol","Symbol"):
-                            if k in j[box] and parse_num(j[box][k]):
-                                return parse_num(j[box][k])
-        except Exception:
-            continue
-    return get_symbol_from_dom(driver)
+            block = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), '標的')]").text.strip()
+            if not name:
+                m_name = re.search(r"標的[:：]\s*([^\s／/｜|()（）]+)", block)
+                name = m_name.group(1) if m_name else name
+            if not code:
+                m_code = re.search(r"\((\d{4})\)", block) or re.search(r"[^\d](\d{4})(?:\D|$)", block)
+                code = m_code.group(1) if m_code else code
+        except NoSuchElementException:
+            pass
 
-# ======= Quotes (warrant last; underlying ask1) =======
-def get_warrant_last_via_api(wid):
-    """優先 mem_ta5 → mem_ta; try items['834'] then '257','833'."""
-    urls = [
-        f"{BASE}/ws/Quote.ashx?type=mem_ta5&symbol={wid}",
-        f"{BASE}/Quote.ashx?type=mem_ta5&symbol={wid}",
-        f"{BASE}/ws/Quote.ashx?type=mem_ta&symbol={wid}",
-        f"{BASE}/Quote.ashx?type=mem_ta&symbol={wid}",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=8)
-            if not r.ok: continue
-            items = r.json().get("items", {})
-            for k in ("834","257","833"):
-                v = items.get(k)
-                if parse_num(v):
-                    return parse_num(v)
-        except Exception:
-            continue
-    return ""
+    return name, code
 
-def get_target_sell1_via_api(symbol):
-    """Underlying sell1 via mem_ta5 (fallback mem_ta)."""
-    if not symbol: return ""
-    urls = [
-        f"{BASE}/ws/Quote.ashx?type=mem_ta5&symbol={symbol}",
-        f"{BASE}/Quote.ashx?type=mem_ta5&symbol={symbol}",
-        f"{BASE}/ws/Quote.ashx?type=mem_ta&symbol={symbol}",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=8)
-            if not r.ok: continue
-            j = r.json()
-            for key in ("Asks","asks","Sell","sell","S","s"):
-                arr = j.get(key)
-                if isinstance(arr, list) and arr:
-                    first = arr[0]
-                    if isinstance(first, dict):
-                        for pk in ("Price","price","p"):
-                            v = first.get(pk)
-                            if parse_num(v): return parse_num(v)
-                    else:
-                        if parse_num(first): return parse_num(first)
-        except Exception:
-            continue
-    return ""
-
-def get_target_sell1_from_dom(driver):
+# ======= NEW：從 Yuanta API 取「標的股價＝賣一(ask1)」 =======
+def get_udly_best_ask_from_api(udly_code: str, timeout=8):
+    """
+    /ws/Quote.ashx?type=mem_ta5&symbol={udly_code}
+    鍵位：
+      101=買一, 102=賣一, 103=買二, 104=賣二, ..., 110=賣五
+      113..117=買一~買五量, 118..122=賣一~賣五量
+    回傳 float 或 None
+    """
+    if not udly_code:
+        return None
+    url = f"https://www.warrantwin.com.tw/eyuanta/ws/Quote.ashx?type=mem_ta5&symbol={udly_code}"
     try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.XPATH, "//*[contains(normalize-space(.),'標的五檔報價')]"))
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", {})
+        ask1 = items.get("102") if isinstance(items, dict) else None
+        if ask1 is None and isinstance(items, dict):  # 保險：整數鍵
+            ask1 = items.get(102)
+        if ask1 is None:
+            return None
+        try:
+            return float(str(ask1).replace(",", ""))
+        except Exception:
+            return None
+    except Exception as e:
+        print("⚠️ get_udly_best_ask_from_api error:", e)
+        return None
+
+# （可留作備援）從 DOM 五檔表抓第一列賣價
+def get_target_best_ask_from_dom(driver):
+    try:
+        WebDriverWait(driver, 6).until(
+            EC.presence_of_element_located((By.XPATH, "//*[contains(normalize-space(.), '標的五檔報價')]"))
         )
-        tbl = driver.find_element(By.XPATH, "//*[contains(normalize-space(.),'標的五檔報價')]/following::table[1]")
-        headers = tbl.find_elements(By.XPATH, ".//tr[1]/*")
-        sell_idx = None
-        for i, h in enumerate(headers, start=1):
-            if "賣價" in h.text: sell_idx = i; break
-        if sell_idx is None:
-            headers = tbl.find_elements(By.XPATH, ".//tr[2]/*")
-            for i, h in enumerate(headers, start=1):
-                if "賣價" in h.text: sell_idx = i; break
-        if sell_idx is None: sell_idx = 3
-        for row_i in [2,1,3]:
-            try:
-                cell = tbl.find_element(By.XPATH, f".//tr[{row_i}]/td[{sell_idx}]")
-                v = cell.text.strip()
-                if v: return v.replace(",", "")
-            except NoSuchElementException:
-                continue
+        td = driver.find_element(
+            By.XPATH, "//*[contains(normalize-space(.), '標的五檔報價')]/following::table[1]//tr[1]/td[3]"
+        )
+        return td.text.strip().replace(",", "")
     except Exception:
         return ""
-    return ""
 
-# ======= Scrape one WID =======
+def ensure_all_keys(row: dict) -> dict:
+    for k in HEADER_ORDER:
+        row.setdefault(k, "")
+    return row
+
+# ======= 抓單筆 =======
 def scrape_one_wid(driver, wid):
-    url = f"{BASE}/Warrant/Info.aspx?WID={wid}"
+    url = f"https://www.warrantwin.com.tw/eyuanta/Warrant/Info.aspx?WID={wid}"
     driver.get(url)
 
-    status = "OK"
     try:
         WebDriverWait(driver, 12).until(
-            EC.presence_of_element_located((By.XPATH, "//*[contains(@ng-bind,'WAR_BUY_PRICE')]"))
+            EC.presence_of_element_located((By.XPATH, "//*[contains(@ng-bind, 'WAR_BUY_PRICE')]"))
         )
-        wait_text_not_empty(driver, By.XPATH, "//*[contains(@ng-bind,'WAR_BUY_PRICE')]", timeout=20)
     except TimeoutException:
-        status = "No price section / not a warrant?"
+        return ensure_all_keys({
+            "WID": wid, "狀態": "Timeout", "來源網址": url,
+            "抓取時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
 
-    # Prices (warrant)
-    deal = get_warrant_last_via_api(wid) or text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind,'WAR_DEAL_PRICE')]")
-    buy  = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind,'WAR_BUY_PRICE')]")
-    sell = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind,'WAR_SELL_PRICE')]")
+    # 三價
+    deal = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_DEAL_PRICE')]")
+    buy  = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_BUY_PRICE')]")
+    sell = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_SELL_PRICE')]")
 
-    # Target info (fallback)
-    tgt_name, tgt_px = get_target_info_from_page(driver)
+    # 備援：class="tBig"
+    if not (deal and buy and sell):
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_all_elements_located((By.CLASS_NAME, "tBig"))
+            )
+            prices = [e.text.strip() for e in driver.find_elements(By.CLASS_NAME, "tBig")]
+            if len(prices) >= 3:
+                deal = deal or prices[0]
+                buy  = buy  or prices[1]
+                sell = sell or prices[2]
+        except TimeoutException:
+            pass
 
-    # Underlying symbol → ask1
-    symbol = get_underlying_symbol_by_wid(wid, driver)
-    sell1  = get_target_sell1_via_api(symbol) or get_target_sell1_from_dom(driver) or tgt_px
+    # 標的名稱與代碼
+    tgt_name, tgt_code = get_target_name_code(driver)
 
-    # Basic fields by label
-    basic = {lab: find_basic_value_by_label(driver, lab) for lab in BASIC_LABELS}
+    # ★ 先用 API 取標的股價（賣一＝items['102']）
+    tgt_stock_price = get_udly_best_ask_from_api(tgt_code)
 
-    if not (deal or buy or sell):
-        status = "No prices"
+    # 若 API 失敗，退回 DOM 備援
+    if tgt_stock_price is None:
+        dom_price = get_target_best_ask_from_dom(driver)
+        tgt_stock_price = float(dom_price) if dom_price else ""
 
     row = {
         "WID": wid,
-        "狀態": status,
+        "狀態": "OK",
         "成交價": deal,
         "買價": buy,
         "賣價": sell,
         "標的名稱": tgt_name,
-        "標的現價": tgt_px,
-        "標的股價": sell1,     # << this is the new column you wanted
-        "標的代碼": symbol,
-        **basic,
-        "抓取時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "標的股價": tgt_stock_price,  # ← 來自 API (items['102'])；若失敗用 DOM 備援
+        "標的代碼": tgt_code,
         "來源網址": url,
+        "抓取時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    return row
 
-# ======= Excel: add/update 試算 sheet =======
-def add_calc_sheet(wb, data_sheet="元大權證", default_wid="", default_target_px="", default_iv=""):
-    if data_sheet not in wb.sheetnames:
-        wb.create_sheet(data_sheet)
-    calc = wb["試算"] if "試算" in wb.sheetnames else wb.create_sheet("試算")
-    calc.delete_rows(1, calc.max_row or 1)
+    for label in BASIC_LABELS:
+        row[label] = find_basic_value_by_label(driver, label)
 
-    # 輸入欄位
+    return ensure_all_keys(row)
+
+# ======= 寫 Excel + 試算 =======
+def save_rows_to_excel(rows, filename="yuanta_warrants.xlsx"):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "元大權證"
+
+    ws.append(HEADER_ORDER)
+    for r in rows:
+        ws.append([r.get(k, "") for k in HEADER_ORDER])
+
+    # 試算頁（以第一筆為例）
+    r0 = rows[0]
+    calc = wb.create_sheet("試算")
+
+    # 標籤
     calc["A1"] = "WID"
     calc["A2"] = "標的股價"
     calc["A3"] = "買價隱波（％）"
@@ -286,87 +228,48 @@ def add_calc_sheet(wb, data_sheet="元大權證", default_wid="", default_target
     calc["F3"] = "剩餘天數"
     calc["F4"] = "行使比例（數值）"
 
-    # 預填欄位值
-    calc["B1"] = default_wid or "03111U"
-    calc["B2"] = default_target_px or ""
-    calc["B3"] = default_iv or ""
+    # 小工具：轉 float
+    def to_float(x):
+        try:
+            return float(str(x).replace(",", ""))
+        except Exception:
+            return x
+
+    # 值
+    calc["B1"] = r0.get("WID", "")
+    calc["B2"] = to_float(r0.get("標的股價", ""))
+    calc["B3"] = to_float(r0.get("買價隱波", ""))
     calc["B4"] = datetime.now().strftime("%Y/%m/%d")
-    calc["B6"] = 0.01  # 無風險利率
+    calc["B6"] = 0.01
+    calc["G2"] = to_float(r0.get("最新履約價", ""))
+    calc["G3"] = to_float(r0.get("剩餘天數", ""))
+    calc["G4"] = to_float(r0.get("最新行使比例", ""))
+    calc["C10"] = f"成交價: {r0.get('成交價', '')}"
 
-    # 自動抓資料欄位
-    calc["G2"] = (
-        f'=IFERROR(INDEX(\'{data_sheet}\'!$A:$ZZ, MATCH($B$1, \'{data_sheet}\'!$A:$A, 0), '
-        f'MATCH("最新履約價", \'{data_sheet}\'!$1:$1, 0)), "")'
-    )
-    calc["G3"] = (
-        f'=IFERROR(INDEX(\'{data_sheet}\'!$A:$ZZ, MATCH($B$1, \'{data_sheet}\'!$A:$A, 0), '
-        f'MATCH("剩餘天數", \'{data_sheet}\'!$1:$1, 0)), "")'
-    )
-    # ✅ 修正這段！抓不到冒號就不要找冒號
-    calc["G4"] = (
-        f'=IFERROR(INDEX(\'{data_sheet}\'!$A:$ZZ, MATCH($B$1, \'{data_sheet}\'!$A:$A, 0), '
-        f'MATCH("最新行使比例", \'{data_sheet}\'!$1:$1, 0)), "")'
-    )
-
-    # 理論價格計算
-    calc["C9"] = "理論權證價"
-    calc["C10"] = (
-        "=LET(S,$B$2, sigma,$B$3/100, K,$G$2, r,$B$6, T,$G$3/365,"
-        " d1,(LN(S/K)+(r+0.5*sigma^2)*T)/(sigma*SQRT(T)), d2,d1-sigma*SQRT(T),"
-        " C, S*NORM.S.DIST(d1,TRUE)-K*EXP(-r*T)*NORM.S.DIST(d2,TRUE), C/$G$4)"
-    )
-    calc["C11"] = (
-        '="依您所輸入數據試算出：該檔權證可能的價格為 " & TEXT($C$10,"0.000")'
-    )
-
-    # 調整欄寬與格式
-    for col, width in [("A", 18), ("B", 18), ("C", 38), ("F", 24), ("G", 20)]:
+    # 粗體 & 欄寬
+    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4"]:
+        calc[cell].font = openpyxl.styles.Font(bold=True)
+    for col, width in [("A",16),("B",14),("C",28),("F",22),("G",18)]:
         calc.column_dimensions[col].width = width
-    for cell in ["A1", "A2", "A3", "A4", "A6", "F2", "F3", "F4", "C9"]:
-        calc[cell].font = Font(bold=True)
 
-# ======= Save to Desktop Excel =======
-def save_rows_to_excel(rows, filename="yuanta_warrants.xlsx"):
-    desktop = os.path.expanduser("~/Desktop")
-    os.makedirs(desktop, exist_ok=True)
+    # 儲存到桌面
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     out_path = os.path.join(desktop, filename)
-
-    if os.path.exists(out_path):
-        wb = openpyxl.load_workbook(out_path)
-        ws = wb["元大權證"] if "元大權證" in wb.sheetnames else wb.create_sheet("元大權證")
-        if ws.max_row == 1 and ws["A1"].value is None:
-            ws.append(HEADER_ORDER)
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "元大權證"
-        ws.append(HEADER_ORDER)
-
-    for r in rows:
-        ws.append([r.get(h, "") for h in HEADER_ORDER])
-
-    seed = rows[0]
-    default_wid = seed.get("WID","")
-    default_target_px = seed.get("標的股價","") or seed.get("標的現價","")
-    default_iv = parse_num(seed.get("買價隱波",""))
-
-    add_calc_sheet(wb, data_sheet="元大權證",
-                   default_wid=default_wid,
-                   default_target_px=default_target_px,
-                   default_iv=default_iv)
-
     wb.save(out_path)
-    print(f"✅ Excel written: {out_path}")
+    print(f"✅ 已寫入 Excel：{out_path}")
 
-# ======= main =======
+# ======= 主流程 =======
 def main():
     driver = launch_driver(headless=False)
     rows = []
     try:
-        for wid in WID_LIST:
-            print(f"抓取 {wid} …")
+        for wid in wid_list:
+            print(f"🔎 抓取 {wid} 中...")
             row = scrape_one_wid(driver, wid)
-            print(f"→ 成交價:{row.get('成交價','')}  標的代碼:{row.get('標的代碼','')}  標的股價:{row.get('標的股價','')}")
+            print(
+                f"→ 成交:{row.get('成交價','')} 買:{row.get('買價','')} 賣:{row.get('賣價','')} | "
+                f"標的代碼:{row.get('標的代碼','')} 標的股價(賣一):{row.get('標的股價','')}"
+            )
             rows.append(row)
             time.sleep(0.3)
     finally:
@@ -375,7 +278,7 @@ def main():
     if rows:
         save_rows_to_excel(rows)
     else:
-        print("⚠️ 沒有任何可寫入的資料")
+        print("⚠️ 沒有資料可寫入")
 
 if __name__ == "__main__":
     main()
