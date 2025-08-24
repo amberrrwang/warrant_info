@@ -1,3 +1,4 @@
+# 可以抓資料 不能試算
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -10,8 +11,12 @@ import openpyxl, os, re, time
 import requests  # ← 新增：用來打 Yuanta API
 
 # ======= 設定 =======
-wid_list = ["03111U"]
-
+wid_list = [
+    "03111U", "03162U", "03485U", "03616U", "03662U",
+    "03281U", "03864U", "05831P", "063866", "065413", "071599",
+    "07879P", "079683", "085398", "08700P", "08769P", "08992P",
+    "71280U", "71286U", "71289U", "71344U", "71974U"
+]
 BASIC_LABELS = [
     "上市日期","最後交易日","到期日期","發行型態","最新發行張數",
     "流通在外張數/比例","最新履約價","最新行使比例",
