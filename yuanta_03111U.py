@@ -9,14 +9,13 @@ from webdriver_manager.chrome import ChromeDriverManager
 from datetime import datetime
 import openpyxl, os, re, time
 import requests  # ← 新增：用來打 Yuanta API
+import math
 
 # ======= 設定 =======
 wid_list = [
-    "03111U", "03162U", "03485U", "03616U", "03662U",
-    "03281U", "03864U", "05831P", "063866", "065413", "071599",
-    "07879P", "079683", "085398", "08700P", "08769P", "08992P",
-    "71280U", "71286U", "71289U", "71344U", "71974U"
+    "03111U"
 ]
+
 BASIC_LABELS = [
     "上市日期","最後交易日","到期日期","發行型態","最新發行張數",
     "流通在外張數/比例","最新履約價","最新行使比例",
@@ -222,42 +221,69 @@ def save_rows_to_excel(rows, filename="yuanta_warrants.xlsx"):
     r0 = rows[0]
     calc = wb.create_sheet("試算")
 
-    # 標籤
+    # ===== 標籤 =====
     calc["A1"] = "WID"
+    calc["B1"] = r0.get("WID", "")
     calc["A2"] = "標的股價"
+    calc["B2"] = str(r0.get("標的股價", ""))
     calc["A3"] = "買價隱波（％）"
+    calc["B3"] = str(r0.get("買價隱波", "")).replace("%", "")
     calc["A4"] = "評價日"
+    calc["B4"] = datetime.now().strftime("%Y/%m/%d")
     calc["A6"] = "無風險利率 r（年化）"
+    calc["B6"] = 0.02  # 先假設 2%，你可以自己改
+
     calc["F1"] = "（以下自動帶入）"
     calc["F2"] = "履約價 K"
+    calc["G2"] = str(r0.get("最新履約價", ""))
     calc["F3"] = "剩餘天數"
+    calc["G3"] = str(r0.get("剩餘天數", ""))
     calc["F4"] = "行使比例（數值）"
+    calc["G4"] = str(r0.get("最新行使比例", ""))
 
-    # 小工具：轉 float
-    def to_float(x):
-        try:
-            return float(str(x).replace(",", ""))
-        except Exception:
-            return x
+    # ===== Excel 公式 =====
+    def call_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+        return (f"=({S}*NORMDIST({d1},0,1,TRUE) - {K}*EXP(-{R}*({DAYS}/365))*NORMDIST({d2},0,1,TRUE))*{CR}")
 
-    # 值
-    calc["B1"] = r0.get("WID", "")
-    calc["B2"] = to_float(r0.get("標的股價", ""))
-    calc["B3"] = to_float(r0.get("買價隱波", ""))
-    calc["B4"] = datetime.now().strftime("%Y/%m/%d")
-    calc["B6"] = 0.01
-    calc["G2"] = to_float(r0.get("最新履約價", ""))
-    calc["G3"] = to_float(r0.get("剩餘天數", ""))
-    calc["G4"] = to_float(r0.get("最新行使比例", ""))
+    def put_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+        return (f"=({K}*EXP(-{R}*({DAYS}/365))*NORMDIST(-({d2}),0,1,TRUE) - {S}*NORMDIST(-({d1}),0,1,TRUE))*{CR}")
+
+    # 判斷認購/認售（你的 rows 有 "發行型態" 或 "認購/認售"）
+    issue_type = str(r0.get("發行型態", "")) + str(r0.get("認購/認售", ""))
+    is_put = "認售" in issue_type
+
+    calc["A8"] = "理論價 (BS)"
+    calc["B8"] = put_formula_str() if is_put else call_formula_str()
+
+    # ===== API 理論價（抓 Quote.ashx） =====
+    try:
+        S_num = float(str(r0.get("標的股價", "")).replace(",", ""))
+        conv = float(str(r0.get("最新行使比例", "")).replace(",", ""))
+        wid = r0.get("WID", "")
+        war_type = 2 if is_put else 1
+        url = f"https://www.warrantwin.com.tw/eyuanta/ws/Quote.ashx?type=calc&symbol={wid}&war_type={war_type}&conver_rate={conv}&udly_price={S_num}&bid_price=1.0"
+        j = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8).json()
+        api_price = j["calc"].get("PriceTheory")
+    except Exception:
+        api_price = None
+
+    calc["A9"] = "API 理論價"
+    calc["B9"] = api_price if api_price else "N/A"
+
+    # 成交價顯示
     calc["C10"] = f"成交價: {r0.get('成交價', '')}"
 
-    # 粗體 & 欄寬
-    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4"]:
+    # 格式化
+    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4","A8","A9"]:
         calc[cell].font = openpyxl.styles.Font(bold=True)
     for col, width in [("A",16),("B",14),("C",28),("F",22),("G",18)]:
         calc.column_dimensions[col].width = width
 
-    # 儲存到桌面
+    # 儲存
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     out_path = os.path.join(desktop, filename)
     wb.save(out_path)
