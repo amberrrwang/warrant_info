@@ -16,6 +16,7 @@ wid_list = [
     "03281U", "03864U", "05831P", "063866", "065413", "071599",
     "07879P", "079683", "085398", "08700P", "08769P", "08992P",
     "71280U", "71286U", "71289U", "71344U", "71974U"
+
 ]
 
 BASIC_LABELS = [
@@ -263,82 +264,70 @@ def scrape_one_wid(driver, wid):
     return ensure_all_keys(row)
 
 # ======= 寫 Excel + 試算 =======
+def clean_number(val):
+    """把文字轉成純數字字串，去掉 %, 天, 逗號等雜字"""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    s = s.replace(",", "")
+    s = s.replace("%", "")
+    s = re.sub(r"[^\d.]", "", s)  # 保留數字和小數點
+    return s
+
 def save_rows_to_excel(rows, filename="yuanta_warrants.xlsx"):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "元大權證"
-
     ws.append(HEADER_ORDER)
+
+    # 主表
     for r in rows:
         ws.append([r.get(k, "") for k in HEADER_ORDER])
 
-    # 試算頁（以第一筆為例）
-    r0 = rows[0]
-    calc = wb.create_sheet("試算")
+    # 每個 WID 各做一張試算表
+    for r in rows:
+        wid = r.get("WID", "")
+        calc = wb.create_sheet(f"試算_{wid}")
 
-    # ===== 標籤 =====
-    calc["A1"] = "WID"
-    calc["B1"] = r0.get("WID", "")
-    calc["A2"] = "標的股價"
-    calc["B2"] = str(r0.get("標的股價", ""))
-    calc["A3"] = "買價隱波（％）"
-    calc["B3"] = str(r0.get("買價隱波", "")).replace("%", "")
-    calc["A4"] = "評價日"
-    calc["B4"] = datetime.now().strftime("%Y/%m/%d")
-    calc["A6"] = "無風險利率 r（年化）"
-    calc["B6"] = 0.02  # 先假設 2%，你可以自己改
+        # ===== 標籤與輸入 =====
+        calc["A1"] = "WID"; calc["B1"] = wid
+        calc["A2"] = "標的股價"; calc["B2"] = clean_number(r.get("標的股價", ""))
+        calc["A3"] = "買價隱波（％）"; calc["B3"] = clean_number(r.get("買價隱波", ""))
+        calc["A4"] = "評價日"; calc["B4"] = datetime.now().strftime("%Y/%m/%d")
+        calc["A6"] = "無風險利率 r（年化）"; calc["B6"] = 0.02
 
-    calc["F1"] = "（以下自動帶入）"
-    calc["F2"] = "履約價 K"
-    calc["G2"] = str(r0.get("最新履約價", ""))
-    calc["F3"] = "剩餘天數"
-    calc["G3"] = str(r0.get("剩餘天數", ""))
-    calc["F4"] = "行使比例（數值）"
-    calc["G4"] = str(r0.get("最新行使比例", ""))
+        calc["F1"] = "（以下自動帶入）"
+        calc["F2"] = "履約價 K"; calc["G2"] = clean_number(r.get("最新履約價", ""))
+        calc["F3"] = "剩餘天數"; calc["G3"] = clean_number(r.get("剩餘天數", ""))
+        calc["F4"] = "行使比例（數值）"; calc["G4"] = clean_number(r.get("最新行使比例", ""))
 
-    # ===== Excel 公式 =====
-    def call_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
-        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
-        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
-        return (f"=({S}*NORMDIST({d1},0,1,TRUE) - {K}*EXP(-{R}*({DAYS}/365))*NORMDIST({d2},0,1,TRUE))*{CR}")
+        # ===== Excel 公式 =====
+        def call_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+            d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+            d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+            return (f"=({S}*NORMDIST({d1},0,1,TRUE) - {K}*EXP(-{R}*({DAYS}/365))*NORMDIST({d2},0,1,TRUE))*{CR}")
 
-    def put_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
-        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
-        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
-        return (f"=({K}*EXP(-{R}*({DAYS}/365))*NORMDIST(-({d2}),0,1,TRUE) - {S}*NORMDIST(-({d1}),0,1,TRUE))*{CR}")
+        def put_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+            d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+            d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+            return (f"=({K}*EXP(-{R}*({DAYS}/365))*NORMDIST(-({d2}),0,1,TRUE) - {S}*NORMDIST(-({d1}),0,1,TRUE))*{CR}")
 
-    # 判斷認購/認售（你的 rows 有 "發行型態" 或 "認購/認售"）
-    issue_type = str(r0.get("發行型態", "")) + str(r0.get("認購/認售", ""))
-    is_put = "認售" in issue_type
+        issue_type = str(r.get("發行型態", "")) + str(r.get("認購/認售", ""))
+        is_put = "認售" in issue_type
 
-    calc["A8"] = "理論價 (BS)"
-    calc["B8"] = put_formula_str() if is_put else call_formula_str()
+        calc["A8"] = "理論價 (BS)"
+        calc["B8"] = put_formula_str() if is_put else call_formula_str()
 
-    # ===== API 理論價（抓 Quote.ashx） =====
-    try:
-        S_num = float(str(r0.get("標的股價", "")).replace(",", ""))
-        conv = float(str(r0.get("最新行使比例", "")).replace(",", ""))
-        wid = r0.get("WID", "")
-        war_type = 2 if is_put else 1
-        url = f"https://www.warrantwin.com.tw/eyuanta/ws/Quote.ashx?type=calc&symbol={wid}&war_type={war_type}&conver_rate={conv}&udly_price={S_num}&bid_price=1.0"
-        j = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8).json()
-        api_price = j["calc"].get("PriceTheory")
-    except Exception:
-        api_price = None
+        # 成交價顯示
+        calc["C10"] = f"成交價: {r.get('成交價', '')}"
 
-    calc["A9"] = "API 理論價"
-    calc["B9"] = api_price if api_price else "N/A"
+        # 格式化
+        for cell in ["A1","A2","A3","A4","A6","F2","F3","F4","A8"]:
+            calc[cell].font = openpyxl.styles.Font(bold=True)
+        for col, width in [("A",16),("B",14),("C",28),("F",22),("G",18)]:
+            calc.column_dimensions[col].width = width
 
-    # 成交價顯示
-    calc["C10"] = f"成交價: {r0.get('成交價', '')}"
-
-    # 格式化
-    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4","A8","A9"]:
-        calc[cell].font = openpyxl.styles.Font(bold=True)
-    for col, width in [("A",16),("B",14),("C",28),("F",22),("G",18)]:
-        calc.column_dimensions[col].width = width
-
-    # 儲存
+    # 儲存到桌面
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     out_path = os.path.join(desktop, filename)
     wb.save(out_path)
