@@ -1,4 +1,3 @@
-# 可以抓資料 不能試算
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -8,7 +7,8 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from datetime import datetime
 import openpyxl, os, re, time
-import requests  # ← 新增：用來打 Yuanta API
+import requests 
+import math
 
 # ======= 設定 =======
 wid_list = [
@@ -17,6 +17,7 @@ wid_list = [
     "07879P", "079683", "085398", "08700P", "08769P", "08992P",
     "71280U", "71286U", "71289U", "71344U", "71974U"
 ]
+
 BASIC_LABELS = [
     "上市日期","最後交易日","到期日期","發行型態","最新發行張數",
     "流通在外張數/比例","最新履約價","最新行使比例",
@@ -24,7 +25,6 @@ BASIC_LABELS = [
     "剩餘天數","價內外程度","實質槓桿","買賣價差比"
 ]
 
-# 只保留「標的股價」，不再有「標的現價」
 HEADER_ORDER = [
     "WID","狀態","成交價","買價","賣價",
     "標的名稱","標的股價","標的代碼",
@@ -151,14 +151,68 @@ def scrape_one_wid(driver, wid):
     driver.get(url)
 
     try:
+        # 等待頁面顯示正確的 WID，避免殘留舊頁
         WebDriverWait(driver, 12).until(
-            EC.presence_of_element_located((By.XPATH, "//*[contains(@ng-bind, 'WAR_BUY_PRICE')]"))
+            EC.text_to_be_present_in_element((By.XPATH, "//*[contains(@ng-bind, 'WAR_ID') or contains(@id,'lblWID')]"), wid)
         )
     except TimeoutException:
         return ensure_all_keys({
             "WID": wid, "狀態": "Timeout", "來源網址": url,
             "抓取時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+
+    # 三價（成交/買/賣）
+    try:
+        WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.XPATH, "//*[contains(@ng-bind, 'WAR_DEAL_PRICE')]"))
+        )
+    except TimeoutException:
+        pass
+
+    deal = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_DEAL_PRICE')]")
+    buy  = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_BUY_PRICE')]")
+    sell = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_SELL_PRICE')]")
+
+    # 備援：用 class="tBig"
+    if not (deal and buy and sell):
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_all_elements_located((By.CLASS_NAME, "tBig"))
+            )
+            prices = [e.text.strip() for e in driver.find_elements(By.CLASS_NAME, "tBig")]
+            if len(prices) >= 3:
+                deal = deal or prices[0]
+                buy  = buy  or prices[1]
+                sell = sell or prices[2]
+        except TimeoutException:
+            pass
+
+    # 標的名稱與代碼
+    tgt_name, tgt_code = get_target_name_code(driver)
+
+    # 標的股價（優先 API → DOM 備援）
+    tgt_stock_price = get_udly_best_ask_from_api(tgt_code)
+    if tgt_stock_price is None:
+        dom_price = get_target_best_ask_from_dom(driver)
+        tgt_stock_price = float(dom_price) if dom_price else ""
+
+    row = {
+        "WID": wid,
+        "狀態": "OK",
+        "成交價": deal,
+        "買價": buy,
+        "賣價": sell,
+        "標的名稱": tgt_name,
+        "標的股價": tgt_stock_price,
+        "標的代碼": tgt_code,
+        "來源網址": url,
+        "抓取時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    for label in BASIC_LABELS:
+        row[label] = find_basic_value_by_label(driver, label)
+
+    return ensure_all_keys(row)
 
     # 三價
     deal = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_DEAL_PRICE')]")
@@ -222,42 +276,69 @@ def save_rows_to_excel(rows, filename="yuanta_warrants.xlsx"):
     r0 = rows[0]
     calc = wb.create_sheet("試算")
 
-    # 標籤
+    # ===== 標籤 =====
     calc["A1"] = "WID"
+    calc["B1"] = r0.get("WID", "")
     calc["A2"] = "標的股價"
+    calc["B2"] = str(r0.get("標的股價", ""))
     calc["A3"] = "買價隱波（％）"
+    calc["B3"] = str(r0.get("買價隱波", "")).replace("%", "")
     calc["A4"] = "評價日"
+    calc["B4"] = datetime.now().strftime("%Y/%m/%d")
     calc["A6"] = "無風險利率 r（年化）"
+    calc["B6"] = 0.02  # 先假設 2%，你可以自己改
+
     calc["F1"] = "（以下自動帶入）"
     calc["F2"] = "履約價 K"
+    calc["G2"] = str(r0.get("最新履約價", ""))
     calc["F3"] = "剩餘天數"
+    calc["G3"] = str(r0.get("剩餘天數", ""))
     calc["F4"] = "行使比例（數值）"
+    calc["G4"] = str(r0.get("最新行使比例", ""))
 
-    # 小工具：轉 float
-    def to_float(x):
-        try:
-            return float(str(x).replace(",", ""))
-        except Exception:
-            return x
+    # ===== Excel 公式 =====
+    def call_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+        return (f"=({S}*NORMDIST({d1},0,1,TRUE) - {K}*EXP(-{R}*({DAYS}/365))*NORMDIST({d2},0,1,TRUE))*{CR}")
 
-    # 值
-    calc["B1"] = r0.get("WID", "")
-    calc["B2"] = to_float(r0.get("標的股價", ""))
-    calc["B3"] = to_float(r0.get("買價隱波", ""))
-    calc["B4"] = datetime.now().strftime("%Y/%m/%d")
-    calc["B6"] = 0.01
-    calc["G2"] = to_float(r0.get("最新履約價", ""))
-    calc["G3"] = to_float(r0.get("剩餘天數", ""))
-    calc["G4"] = to_float(r0.get("最新行使比例", ""))
+    def put_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+        return (f"=({K}*EXP(-{R}*({DAYS}/365))*NORMDIST(-({d2}),0,1,TRUE) - {S}*NORMDIST(-({d1}),0,1,TRUE))*{CR}")
+
+    # 判斷認購/認售（你的 rows 有 "發行型態" 或 "認購/認售"）
+    issue_type = str(r0.get("發行型態", "")) + str(r0.get("認購/認售", ""))
+    is_put = "認售" in issue_type
+
+    calc["A8"] = "理論價 (BS)"
+    calc["B8"] = put_formula_str() if is_put else call_formula_str()
+
+    # ===== API 理論價（抓 Quote.ashx） =====
+    try:
+        S_num = float(str(r0.get("標的股價", "")).replace(",", ""))
+        conv = float(str(r0.get("最新行使比例", "")).replace(",", ""))
+        wid = r0.get("WID", "")
+        war_type = 2 if is_put else 1
+        url = f"https://www.warrantwin.com.tw/eyuanta/ws/Quote.ashx?type=calc&symbol={wid}&war_type={war_type}&conver_rate={conv}&udly_price={S_num}&bid_price=1.0"
+        j = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8).json()
+        api_price = j["calc"].get("PriceTheory")
+    except Exception:
+        api_price = None
+
+    calc["A9"] = "API 理論價"
+    calc["B9"] = api_price if api_price else "N/A"
+
+    # 成交價顯示
     calc["C10"] = f"成交價: {r0.get('成交價', '')}"
 
-    # 粗體 & 欄寬
-    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4"]:
+    # 格式化
+    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4","A8","A9"]:
         calc[cell].font = openpyxl.styles.Font(bold=True)
     for col, width in [("A",16),("B",14),("C",28),("F",22),("G",18)]:
         calc.column_dimensions[col].width = width
 
-    # 儲存到桌面
+    # 儲存
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     out_path = os.path.join(desktop, filename)
     wb.save(out_path)

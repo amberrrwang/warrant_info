@@ -1,4 +1,3 @@
-# 可以抓資料 不能試算
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -8,7 +7,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from datetime import datetime
 import openpyxl, os, re, time
-import requests  # ← 新增：用來打 Yuanta API
+import requests 
 import math
 
 # ======= 設定 =======

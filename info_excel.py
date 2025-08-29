@@ -1,3 +1,4 @@
+# 可以抓資料 不能試算
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -8,14 +9,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 from datetime import datetime
 import openpyxl, os, re, time
 import requests  # ← 新增：用來打 Yuanta API
+import math
 
 # ======= 設定 =======
-wid_list = [
-    "03111U", "03162U", "03485U", "03616U", "03662U",
-    "03281U", "03864U", "05831P", "063866", "065413", "071599",
-    "07879P", "079683", "085398", "08700P", "08769P", "08992P",
-    "71280U", "71286U", "71289U", "71344U", "71974U"
-]
+wid_list = ["03111U","03126U","03485U"]
 
 BASIC_LABELS = [
     "上市日期","最後交易日","到期日期","發行型態","最新發行張數",
@@ -98,72 +95,34 @@ def get_target_name_code(driver):
     return name, code
 
 # ======= NEW：從 Yuanta API 取「標的股價＝賣一(ask1)」 =======
-def _to_num(x):
-    if x is None: 
-        return None
-    try:
-        return float(str(x).replace(",", "").strip())
-    except:
-        return None
-
-def get_udly_mid_from_api(udly_code: str, timeout=8):
-    """五檔 API：回傳 (bid1+ask1)/2 中間價；若缺邊就回現有那邊；全失敗回 None。"""
+def get_udly_best_ask_from_api(udly_code: str, timeout=8):
+    """
+    /ws/Quote.ashx?type=mem_ta5&symbol={udly_code}
+    鍵位：
+      101=買一, 102=賣一, 103=買二, 104=賣二, ..., 110=賣五
+      113..117=買一~買五量, 118..122=賣一~賣五量
+    回傳 float 或 None
+    """
     if not udly_code:
         return None
     url = f"https://www.warrantwin.com.tw/eyuanta/ws/Quote.ashx?type=mem_ta5&symbol={udly_code}"
     try:
-        r = requests.get(url, timeout=timeout); r.raise_for_status()
-        items = r.json().get("items", {})
-        bid1 = items.get("101") if isinstance(items, dict) else None
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", {})
         ask1 = items.get("102") if isinstance(items, dict) else None
-        bid1, ask1 = _to_num(bid1), _to_num(ask1)
-        if bid1 is not None and ask1 is not None:
-            return (bid1 + ask1) / 2
-        return ask1 if ask1 is not None else bid1
-    except Exception:
-        return None
-
-def parse_conver_rate(v):
-    """把『最新行使比例』欄位轉成 float；支援 '0.0050'、'0.5%'、'1/200' 之類字串。"""
-    if v is None: 
-        return None
-    s = str(v).strip()
-    # 分數
-    if "/" in s:
+        if ask1 is None and isinstance(items, dict):  # 保險：整數鍵
+            ask1 = items.get(102)
+        if ask1 is None:
+            return None
         try:
-            a, b = s.split("/", 1)
-            return float(a) / float(b)
+            return float(str(ask1).replace(",", ""))
         except Exception:
-            pass
-    # 百分比
-    if s.endswith("%"):
-        try:
-            return float(s[:-1].replace(",", "")) / 100.0
-        except Exception:
-            pass
-    # 一般數字
-    try:
-        return float(s.replace(",", ""))
-    except Exception:
+            return None
+    except Exception as e:
+        print("⚠️ get_udly_best_ask_from_api error:", e)
         return None
-
-def yuanta_calc_price(symbol: str, udly_price: float, conver_rate: float, war_type: int = 2, timeout=8):
-    """
-    直呼元大『試算』API，回傳 (PriceTheory, 全部原始 json)。
-    war_type: 2=買權（網站上大多如此），1=賣權（若需要可改）。
-    """
-    url = "https://www.warrantwin.com.tw/eyuanta/ws/Quote.ashx"
-    params = {
-        "type": "calc",
-        "symbol": symbol,
-        "war_type": war_type,
-        "conver_rate": f"{conver_rate:.6f}",
-        "udly_price": f"{udly_price:.4f}",
-    }
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("PriceTheory"), data
 
 # （可留作備援）從 DOM 五檔表抓第一列賣價
 def get_target_best_ask_from_dom(driver):
@@ -189,7 +148,7 @@ def scrape_one_wid(driver, wid):
     driver.get(url)
 
     try:
-        WebDriverWait(driver, 20).until(
+        WebDriverWait(driver, 12).until(
             EC.presence_of_element_located((By.XPATH, "//*[contains(@ng-bind, 'WAR_BUY_PRICE')]"))
         )
     except TimeoutException:
@@ -203,11 +162,30 @@ def scrape_one_wid(driver, wid):
     buy  = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_BUY_PRICE')]")
     sell = text_or_blank(driver, By.XPATH, "//*[contains(@ng-bind, 'WAR_SELL_PRICE')]")
 
-    # 標的名稱/代碼
+    # 備援：class="tBig"
+    if not (deal and buy and sell):
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_all_elements_located((By.CLASS_NAME, "tBig"))
+            )
+            prices = [e.text.strip() for e in driver.find_elements(By.CLASS_NAME, "tBig")]
+            if len(prices) >= 3:
+                deal = deal or prices[0]
+                buy  = buy  or prices[1]
+                sell = sell or prices[2]
+        except TimeoutException:
+            pass
+
+    # 標的名稱與代碼
     tgt_name, tgt_code = get_target_name_code(driver)
 
-    # 標的股價：先用中間價（你也可改成成交價）
-    udly_mid = get_udly_mid_from_api(tgt_code)
+    # ★ 先用 API 取標的股價（賣一＝items['102']）
+    tgt_stock_price = get_udly_best_ask_from_api(tgt_code)
+
+    # 若 API 失敗，退回 DOM 備援
+    if tgt_stock_price is None:
+        dom_price = get_target_best_ask_from_dom(driver)
+        tgt_stock_price = float(dom_price) if dom_price else ""
 
     row = {
         "WID": wid,
@@ -216,33 +194,14 @@ def scrape_one_wid(driver, wid):
         "買價": buy,
         "賣價": sell,
         "標的名稱": tgt_name,
-        "標的股價": udly_mid,   # 供參考
+        "標的股價": tgt_stock_price,  # ← 來自 API (items['102'])；若失敗用 DOM 備援
         "標的代碼": tgt_code,
         "來源網址": url,
         "抓取時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    # 基本欄
     for label in BASIC_LABELS:
         row[label] = find_basic_value_by_label(driver, label)
-
-    # 解析行使比例（calc API 需要）
-    conver_rate = parse_conver_rate(row.get("最新行使比例"))
-
-    # 呼叫 calc API：用中間價（或你想要的 S）來求官網理論價
-    price_theory = None
-    if udly_mid is not None and conver_rate is not None:
-        try:
-            price_theory, _raw = yuanta_calc_price(
-                symbol=wid,
-                udly_price=float(udly_mid),
-                conver_rate=float(conver_rate),
-                war_type=2  # 買權
-            )
-        except Exception as e:
-            print("⚠️ yuanta_calc_price error:", e)
-
-    row["理論價(PriceTheory)"] = price_theory  # 這就是官網顯示的 1.3 那個數
 
     return ensure_all_keys(row)
 
@@ -252,99 +211,95 @@ def save_rows_to_excel(rows, filename="yuanta_warrants.xlsx"):
     ws = wb.active
     ws.title = "元大權證"
 
-    # 寫表頭 + 資料
+    # 總表：所有權證的基本資料
     ws.append(HEADER_ORDER)
     for r in rows:
         ws.append([r.get(k, "") for k in HEADER_ORDER])
 
-    # 建立試算頁
+    # ===== 共用試算頁 =====
+    r0 = rows[0]
     calc = wb.create_sheet("試算")
 
-    # 標籤
+    # 基本輸入
     calc["A1"] = "WID"
+    calc["B1"] = r0.get("WID", "")
     calc["A2"] = "標的股價"
+    calc["B2"] = str(r0.get("標的股價", ""))
     calc["A3"] = "買價隱波（％）"
+    calc["B3"] = str(r0.get("買價隱波", "")).replace("%", "")
     calc["A4"] = "評價日"
+    calc["B4"] = datetime.now().strftime("%Y/%m/%d")
     calc["A6"] = "無風險利率 r（年化）"
+    calc["B6"] = 0.02  # 預設值，可自行改
+
+    # 自動帶入
     calc["F1"] = "（以下自動帶入）"
     calc["F2"] = "履約價 K"
+    calc["G2"] = f'=VLOOKUP($B$1,\'元大權證\'!A:Z,MATCH("最新履約價",\'元大權證\'!1:1,0),FALSE)'
     calc["F3"] = "剩餘天數"
+    calc["G3"] = f'=VLOOKUP($B$1,\'元大權證\'!A:Z,MATCH("剩餘天數",\'元大權證\'!1:1,0),FALSE)'
     calc["F4"] = "行使比例（數值）"
+    calc["G4"] = f'=VLOOKUP($B$1,\'元大權證\'!A:Z,MATCH("最新行使比例",\'元大權證\'!1:1,0),FALSE)'
 
-    # 預設把 B1 設成第一筆的 WID（可用下拉切換）
-    first_wid = rows[0].get("WID", "") if rows else ""
-    calc["B1"] = first_wid
+    # Excel 公式：Call/Put
+    def call_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+        return f"=({S}*NORMDIST({d1},0,1,TRUE) - {K}*EXP(-{R}*({DAYS}/365))*NORMDIST({d2},0,1,TRUE))*{CR}"
 
-    # ---- 以 B1 的 WID 動態查找「元大權證」對應列 ----
-    # 欄位位置（依你的 HEADER_ORDER）
-    # A:WID, G:標的股價, O:最新履約價, P:最新行使比例, Q:買價隱波, U:剩餘天數
-    sheet_name = "'元大權證'"
-    calc["B2"] = f"=INDEX({sheet_name}!G:G, MATCH(B1, {sheet_name}!A:A, 0))"
-    # 轉百分比字串為小數：SUBSTITUTE 去掉 %，VALUE 轉數字，再 /100
-    calc["B3"] = (
-    f"=IF(ISNUMBER(INDEX({sheet_name}!Q:Q, MATCH(B1, {sheet_name}!A:A, 0))),"
-    f" INDEX({sheet_name}!Q:Q, MATCH(B1, {sheet_name}!A:A, 0)),"
-    f" IF(RIGHT(INDEX({sheet_name}!Q:Q, MATCH(B1, {sheet_name}!A:A, 0)))=\"%\","
-    f"     VALUE(SUBSTITUTE(INDEX({sheet_name}!Q:Q, MATCH(B1, {sheet_name}!A:A, 0)),\"%\",\"\"))/100,"
-    f"     VALUE(INDEX({sheet_name}!Q:Q, MATCH(B1, {sheet_name}!A:A, 0)))"
-    f" ))"
-    )
-    calc["B4"] = "=TODAY()"
-    calc["B6"] = 0.01  # 你可自行改
+    def put_formula_str(S="B2", K="G2", DAYS="G3", R="B6", IV="B3", CR="G4"):
+        d1 = f"(LN({S}/{K}) + ({R} + (({IV}/100)^2)/2)*({DAYS}/365)) / (({IV}/100)*SQRT({DAYS}/365))"
+        d2 = f"{d1} - ({IV}/100)*SQRT({DAYS}/365)"
+        return f"=({K}*EXP(-{R}*({DAYS}/365))*NORMDIST(-({d2}),0,1,TRUE) - {S}*NORMDIST(-({d1}),0,1,TRUE))*{CR}"
 
-    calc["G2"] = f"=INDEX({sheet_name}!O:O, MATCH(B1, {sheet_name}!A:A, 0))"
-    calc["G3"] = f"=INDEX({sheet_name}!U:U, MATCH(B1, {sheet_name}!A:A, 0))"
-    calc["G4"] = f"=INDEX({sheet_name}!P:P, MATCH(B1, {sheet_name}!A:A, 0))"
+    issue_type = str(r0.get("發行型態", "")) + str(r0.get("認購/認售", ""))
+    is_put = "認售" in issue_type
 
-    # ---- Black–Scholes（買權）公式（乘上行使比例）----
-    bs_formula = (
-    "= ( B2*NORMSDIST((LN(B2/G2)+(B6+B3^2/2)*(G3/365))/(B3*SQRT(G3/365)))"
-    " - G2*EXP(-B6*(G3/365))*NORMSDIST((LN(B2/G2)+(B6-B3^2/2)*(G3/365))/(B3*SQRT(G3/365))) ) * G4"
-    )
-    calc["C10"] = bs_formula
-    calc["B10"] = "成交價："
+    calc["A8"] = "理論價 (BS)"
+    calc["B8"] = put_formula_str() if is_put else call_formula_str()
 
-    # 粗體 & 欄寬
-    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4","B10"]:
+    # API 理論價（用第一筆填入，純參考）
+    try:
+        S_num = float(str(r0.get("標的股價", "")).replace(",", ""))
+        conv = float(str(r0.get("最新行使比例", "")).replace(",", ""))
+        wid = r0.get("WID", "")
+        war_type = 2 if is_put else 1
+        url = (f"https://www.warrantwin.com.tw/eyuanta/ws/Quote.ashx?"
+               f"type=calc&symbol={wid}&war_type={war_type}&conver_rate={conv}&udly_price={S_num}&bid_price=1.0")
+        j = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8).json()
+        api_price = j["calc"].get("PriceTheory")
+    except Exception:
+        api_price = None
+
+    calc["A9"] = "API 理論價 (第一檔)"
+    calc["B9"] = api_price if api_price else "N/A"
+
+    # 格式化
+    for cell in ["A1","A2","A3","A4","A6","F2","F3","F4","A8","A9"]:
         calc[cell].font = openpyxl.styles.Font(bold=True)
-    for col, width in [("A",16),("B",18),("C",28),("F",22),("G",18)]:
+    for col, width in [("A",16),("B",14),("C",28),("F",22),("G",18)]:
         calc.column_dimensions[col].width = width
 
-    # WID 下拉資料驗證（從「元大權證」A2:A?）
-    last_row = ws.max_row
-    from openpyxl.worksheet.datavalidation import DataValidation
-    dv = DataValidation(type="list", formula1=f"={sheet_name}!$A$2:$A${last_row}", allow_blank=False)
-    calc.add_data_validation(dv)
-    dv.add(calc["B1"])
-
-    # 存檔
+    # 儲存
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     out_path = os.path.join(desktop, filename)
     wb.save(out_path)
     print(f"✅ 已寫入 Excel：{out_path}")
 
 # ======= 主流程 =======
-def scrape_with_retry(driver, wid, retries=2, pause=1.2):
-    for i in range(retries + 1):
-        row = scrape_one_wid(driver, wid)
-        if row.get("狀態") == "OK":
-            return row
-        time.sleep(pause)
-    return row 
-     
 def main():
     driver = launch_driver(headless=False)
     rows = []
     try:
         for wid in wid_list:
             print(f"🔎 抓取 {wid} 中...")
-            row = scrape_with_retry(driver, wid, retries=2, pause=1.2)
+            row = scrape_one_wid(driver, wid)
             print(
-                f"→ 狀態:{row.get('狀態')} 成交:{row.get('成交價','')} 買:{row.get('買價','')} 賣:{row.get('賣價','')} | "
+                f"→ 成交:{row.get('成交價','')} 買:{row.get('買價','')} 賣:{row.get('賣價','')} | "
                 f"標的代碼:{row.get('標的代碼','')} 標的股價(賣一):{row.get('標的股價','')}"
             )
             rows.append(row)
-            time.sleep(1.0)  # 每筆之間也放慢
+            time.sleep(0.3)
     finally:
         driver.quit()
 
@@ -355,5 +310,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
